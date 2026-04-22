@@ -12,11 +12,12 @@ using namespace std;
 namespace fs = std::filesystem;
 
 const string DB_FILE = "data/database.db";
+const string INDEX_FILE = "data/index.idx";
 
-// Cache only the most recently accessed index
-string cachedIndex;
-set<int> cachedValues;
-bool cacheValid = false;
+// Cache for current operation
+string currentIndex;
+set<int> currentValues;
+bool hasCurrent = false;
 
 void ensureDataDir() {
     if (!fs::exists("data")) {
@@ -24,120 +25,95 @@ void ensureDataDir() {
     }
 }
 
-// Read specific index from file
-bool readIndexFromFile(const string& index, set<int>& values) {
-    if (!fs::exists(DB_FILE)) {
+// Read index positions from index file
+map<string, streampos> readIndexPositions() {
+    map<string, streampos> positions;
+
+    if (fs::exists(INDEX_FILE)) {
+        ifstream idxFile(INDEX_FILE, ios::binary);
+        if (idxFile.is_open()) {
+            int count;
+            idxFile.read(reinterpret_cast<char*>(&count), sizeof(count));
+
+            for (int i = 0; i < count; i++) {
+                int len;
+                idxFile.read(reinterpret_cast<char*>(&len), sizeof(len));
+
+                string index(len, '\0');
+                idxFile.read(&index[0], len);
+
+                streampos pos;
+                idxFile.read(reinterpret_cast<char*>(&pos), sizeof(pos));
+
+                positions[index] = pos;
+            }
+            idxFile.close();
+        }
+    }
+
+    return positions;
+}
+
+void writeIndexPositions(const map<string, streampos>& positions) {
+    ofstream idxFile(INDEX_FILE, ios::binary);
+    if (!idxFile.is_open()) return;
+
+    int count = positions.size();
+    idxFile.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+    for (const auto& [index, pos] : positions) {
+        int len = index.length();
+        idxFile.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        idxFile.write(index.c_str(), len);
+        idxFile.write(reinterpret_cast<const char*>(&pos), sizeof(pos));
+    }
+
+    idxFile.close();
+}
+
+// Read values for a specific index from data file
+bool readValues(const string& index, set<int>& values) {
+    auto positions = readIndexPositions();
+    auto it = positions.find(index);
+
+    if (it == positions.end()) {
         return false;
     }
 
-    ifstream infile(DB_FILE, ios::binary);
-    if (!infile.is_open()) return false;
+    ifstream dbFile(DB_FILE, ios::binary);
+    if (!dbFile.is_open()) return false;
 
-    int numIndices;
-    infile.read(reinterpret_cast<char*>(&numIndices), sizeof(numIndices));
+    dbFile.seekg(it->second);
 
-    for (int i = 0; i < numIndices; i++) {
-        int indexLen;
-        infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
+    int numValues;
+    dbFile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
 
-        string idx(indexLen, '\0');
-        infile.read(&idx[0], indexLen);
-
-        int numValues;
-        infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
-
-        if (idx == index) {
-            // Found the index
-            for (int j = 0; j < numValues; j++) {
-                int val;
-                infile.read(reinterpret_cast<char*>(&val), sizeof(val));
-                values.insert(val);
-            }
-            infile.close();
-            return true;
-        } else {
-            // Skip this index's values
-            infile.seekg(numValues * sizeof(int), ios::cur);
-        }
+    for (int i = 0; i < numValues; i++) {
+        int val;
+        dbFile.read(reinterpret_cast<char*>(&val), sizeof(val));
+        values.insert(val);
     }
 
-    infile.close();
-    return false;
+    dbFile.close();
+    return true;
 }
 
-// Write entire file with updated values for specific index
-void updateIndexInFile(const string& index, const set<int>& values, bool deleteIndex = false) {
-    // First, read all indices except the one being updated
-    map<string, set<int>> otherIndices;
+// Append data to end of file and update index
+streampos appendData(const string& index, const set<int>& values) {
+    ofstream dbFile(DB_FILE, ios::binary | ios::app);
+    if (!dbFile.is_open()) return -1;
 
-    if (fs::exists(DB_FILE)) {
-        ifstream infile(DB_FILE, ios::binary);
-        if (infile.is_open()) {
-            int numIndices;
-            infile.read(reinterpret_cast<char*>(&numIndices), sizeof(numIndices));
+    streampos pos = dbFile.tellp();
 
-            for (int i = 0; i < numIndices; i++) {
-                int indexLen;
-                infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
+    int numValues = values.size();
+    dbFile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
 
-                string idx(indexLen, '\0');
-                infile.read(&idx[0], indexLen);
-
-                int numValues;
-                infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
-
-                if (idx != index) {
-                    set<int> vals;
-                    for (int j = 0; j < numValues; j++) {
-                        int val;
-                        infile.read(reinterpret_cast<char*>(&val), sizeof(val));
-                        vals.insert(val);
-                    }
-                    otherIndices[idx] = vals;
-                } else {
-                    // Skip the index being updated
-                    infile.seekg(numValues * sizeof(int), ios::cur);
-                }
-            }
-            infile.close();
-        }
+    for (int val : values) {
+        dbFile.write(reinterpret_cast<const char*>(&val), sizeof(val));
     }
 
-    // Write back all indices
-    ofstream outfile(DB_FILE, ios::binary);
-    if (!outfile.is_open()) return;
-
-    int totalIndices = otherIndices.size() + (deleteIndex || values.empty() ? 0 : 1);
-    outfile.write(reinterpret_cast<const char*>(&totalIndices), sizeof(totalIndices));
-
-    for (const auto& [idx, vals] : otherIndices) {
-        int indexLen = idx.length();
-        outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
-        outfile.write(idx.c_str(), indexLen);
-
-        int numValues = vals.size();
-        outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
-
-        for (int val : vals) {
-            outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
-        }
-    }
-
-    // Add the updated index if not deleting
-    if (!deleteIndex && !values.empty()) {
-        int indexLen = index.length();
-        outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
-        outfile.write(index.c_str(), indexLen);
-
-        int numValues = values.size();
-        outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
-
-        for (int val : values) {
-            outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
-        }
-    }
-
-    outfile.close();
+    dbFile.close();
+    return pos;
 }
 
 void insert(const string& index, int value) {
@@ -145,21 +121,25 @@ void insert(const string& index, int value) {
 
     set<int> values;
 
-    // Use cache if available
-    if (cacheValid && cachedIndex == index) {
-        values = cachedValues;
+    // Read current values
+    if (hasCurrent && currentIndex == index) {
+        values = currentValues;
     } else {
-        readIndexFromFile(index, values);
+        readValues(index, values);
     }
 
     values.insert(value);
 
-    // Update cache
-    cachedIndex = index;
-    cachedValues = values;
-    cacheValid = true;
+    // Update current
+    currentIndex = index;
+    currentValues = values;
+    hasCurrent = true;
 
-    updateIndexInFile(index, values);
+    // Update index and append data
+    auto positions = readIndexPositions();
+    streampos pos = appendData(index, values);
+    positions[index] = pos;
+    writeIndexPositions(positions);
 }
 
 void deleteEntry(const string& index, int value) {
@@ -167,23 +147,25 @@ void deleteEntry(const string& index, int value) {
 
     set<int> values;
 
-    // Use cache if available
-    if (cacheValid && cachedIndex == index) {
-        values = cachedValues;
-    } else {
-        if (!readIndexFromFile(index, values)) {
-            return; // Index doesn't exist
-        }
+    // Read current values
+    if (hasCurrent && currentIndex == index) {
+        values = currentValues;
+    } else if (!readValues(index, values)) {
+        return; // Index doesn't exist
     }
 
     values.erase(value);
 
-    // Update cache
-    cachedIndex = index;
-    cachedValues = values;
-    cacheValid = true;
+    // Update current
+    currentIndex = index;
+    currentValues = values;
+    hasCurrent = true;
 
-    updateIndexInFile(index, values, values.empty());
+    // Update index and append data
+    auto positions = readIndexPositions();
+    streampos pos = appendData(index, values);
+    positions[index] = pos;
+    writeIndexPositions(positions);
 }
 
 void find(const string& index) {
@@ -191,19 +173,18 @@ void find(const string& index) {
 
     set<int> values;
 
-    // Use cache if available
-    if (cacheValid && cachedIndex == index) {
-        values = cachedValues;
-    } else {
-        if (!readIndexFromFile(index, values)) {
-            cout << "null" << endl;
-            return;
-        }
-        // Update cache
-        cachedIndex = index;
-        cachedValues = values;
-        cacheValid = true;
+    // Read values
+    if (hasCurrent && currentIndex == index) {
+        values = currentValues;
+    } else if (!readValues(index, values)) {
+        cout << "null" << endl;
+        return;
     }
+
+    // Update current
+    currentIndex = index;
+    currentValues = values;
+    hasCurrent = true;
 
     if (values.empty()) {
         cout << "null" << endl;

@@ -5,19 +5,12 @@
 #include <string>
 #include <sstream>
 #include <filesystem>
-#include <map>
 #include <set>
 
 using namespace std;
 namespace fs = std::filesystem;
 
 const string DB_FILE = "data/database.db";
-const string INDEX_FILE = "data/index.idx";
-
-// Cache for current operation
-string currentIndex;
-set<int> currentValues;
-bool hasCurrent = false;
 
 void ensureDataDir() {
     if (!fs::exists("data")) {
@@ -25,172 +18,189 @@ void ensureDataDir() {
     }
 }
 
-// Read index positions from index file
-map<string, streampos> readIndexPositions() {
-    map<string, streampos> positions;
-
-    if (fs::exists(INDEX_FILE)) {
-        ifstream idxFile(INDEX_FILE, ios::binary);
-        if (idxFile.is_open()) {
-            int count;
-            idxFile.read(reinterpret_cast<char*>(&count), sizeof(count));
-
-            for (int i = 0; i < count; i++) {
-                int len;
-                idxFile.read(reinterpret_cast<char*>(&len), sizeof(len));
-
-                string index(len, '\0');
-                idxFile.read(&index[0], len);
-
-                streampos pos;
-                idxFile.read(reinterpret_cast<char*>(&pos), sizeof(pos));
-
-                positions[index] = pos;
-            }
-            idxFile.close();
-        }
-    }
-
-    return positions;
-}
-
-void writeIndexPositions(const map<string, streampos>& positions) {
-    ofstream idxFile(INDEX_FILE, ios::binary);
-    if (!idxFile.is_open()) return;
-
-    int count = positions.size();
-    idxFile.write(reinterpret_cast<const char*>(&count), sizeof(count));
-
-    for (const auto& [index, pos] : positions) {
-        int len = index.length();
-        idxFile.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        idxFile.write(index.c_str(), len);
-        idxFile.write(reinterpret_cast<const char*>(&pos), sizeof(pos));
-    }
-
-    idxFile.close();
-}
-
-// Read values for a specific index from data file
-bool readValues(const string& index, set<int>& values) {
-    auto positions = readIndexPositions();
-    auto it = positions.find(index);
-
-    if (it == positions.end()) {
-        return false;
-    }
-
-    ifstream dbFile(DB_FILE, ios::binary);
-    if (!dbFile.is_open()) return false;
-
-    dbFile.seekg(it->second);
-
-    int numValues;
-    dbFile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
-
-    for (int i = 0; i < numValues; i++) {
-        int val;
-        dbFile.read(reinterpret_cast<char*>(&val), sizeof(val));
-        values.insert(val);
-    }
-
-    dbFile.close();
-    return true;
-}
-
-// Append data to end of file and update index
-streampos appendData(const string& index, const set<int>& values) {
-    ofstream dbFile(DB_FILE, ios::binary | ios::app);
-    if (!dbFile.is_open()) return -1;
-
-    streampos pos = dbFile.tellp();
-
-    int numValues = values.size();
-    dbFile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
-
-    for (int val : values) {
-        dbFile.write(reinterpret_cast<const char*>(&val), sizeof(val));
-    }
-
-    dbFile.close();
-    return pos;
-}
+// Simple format: index length, index string, value count, values
+// All operations read the entire file and rewrite it
 
 void insert(const string& index, int value) {
     ensureDataDir();
 
-    set<int> values;
+    vector<pair<string, set<int>>> data;
 
-    // Read current values
-    if (hasCurrent && currentIndex == index) {
-        values = currentValues;
-    } else {
-        readValues(index, values);
+    // Read existing data
+    if (fs::exists(DB_FILE)) {
+        ifstream infile(DB_FILE, ios::binary);
+        if (infile.is_open()) {
+            while (infile.peek() != EOF) {
+                int indexLen;
+                infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
+                if (infile.eof()) break;
+
+                string idx(indexLen, '\0');
+                infile.read(&idx[0], indexLen);
+
+                int numValues;
+                infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
+
+                set<int> values;
+                for (int i = 0; i < numValues; i++) {
+                    int val;
+                    infile.read(reinterpret_cast<char*>(&val), sizeof(val));
+                    values.insert(val);
+                }
+
+                data.emplace_back(idx, values);
+            }
+            infile.close();
+        }
     }
 
-    values.insert(value);
+    // Update or add
+    bool found = false;
+    for (auto& [idx, values] : data) {
+        if (idx == index) {
+            values.insert(value);
+            found = true;
+            break;
+        }
+    }
 
-    // Update current
-    currentIndex = index;
-    currentValues = values;
-    hasCurrent = true;
+    if (!found) {
+        set<int> newValues;
+        newValues.insert(value);
+        data.emplace_back(index, newValues);
+    }
 
-    // Update index and append data
-    auto positions = readIndexPositions();
-    streampos pos = appendData(index, values);
-    positions[index] = pos;
-    writeIndexPositions(positions);
+    // Write back
+    ofstream outfile(DB_FILE, ios::binary);
+    if (outfile.is_open()) {
+        for (const auto& [idx, values] : data) {
+            int indexLen = idx.length();
+            outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
+            outfile.write(idx.c_str(), indexLen);
+
+            int numValues = values.size();
+            outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
+
+            for (int val : values) {
+                outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
+            }
+        }
+        outfile.close();
+    }
 }
 
 void deleteEntry(const string& index, int value) {
     ensureDataDir();
 
-    set<int> values;
-
-    // Read current values
-    if (hasCurrent && currentIndex == index) {
-        values = currentValues;
-    } else if (!readValues(index, values)) {
-        return; // Index doesn't exist
+    if (!fs::exists(DB_FILE)) {
+        return;
     }
 
-    values.erase(value);
+    vector<pair<string, set<int>>> data;
 
-    // Update current
-    currentIndex = index;
-    currentValues = values;
-    hasCurrent = true;
+    // Read existing data
+    ifstream infile(DB_FILE, ios::binary);
+    if (infile.is_open()) {
+        while (infile.peek() != EOF) {
+            int indexLen;
+            infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
+            if (infile.eof()) break;
 
-    // Update index and append data
-    auto positions = readIndexPositions();
-    streampos pos = appendData(index, values);
-    positions[index] = pos;
-    writeIndexPositions(positions);
+            string idx(indexLen, '\0');
+            infile.read(&idx[0], indexLen);
+
+            int numValues;
+            infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
+
+            set<int> values;
+            for (int i = 0; i < numValues; i++) {
+                int val;
+                infile.read(reinterpret_cast<char*>(&val), sizeof(val));
+                values.insert(val);
+            }
+
+            data.emplace_back(idx, values);
+        }
+        infile.close();
+    }
+
+    // Update
+    for (auto& [idx, values] : data) {
+        if (idx == index) {
+            values.erase(value);
+            break;
+        }
+    }
+
+    // Remove empty entries
+    data.erase(remove_if(data.begin(), data.end(),
+                        [](const auto& p) { return p.second.empty(); }),
+              data.end());
+
+    // Write back
+    ofstream outfile(DB_FILE, ios::binary);
+    if (outfile.is_open()) {
+        for (const auto& [idx, values] : data) {
+            int indexLen = idx.length();
+            outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
+            outfile.write(idx.c_str(), indexLen);
+
+            int numValues = values.size();
+            outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
+
+            for (int val : values) {
+                outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
+            }
+        }
+        outfile.close();
+    }
 }
 
 void find(const string& index) {
     ensureDataDir();
 
-    set<int> values;
-
-    // Read values
-    if (hasCurrent && currentIndex == index) {
-        values = currentValues;
-    } else if (!readValues(index, values)) {
+    if (!fs::exists(DB_FILE)) {
         cout << "null" << endl;
         return;
     }
 
-    // Update current
-    currentIndex = index;
-    currentValues = values;
-    hasCurrent = true;
+    set<int> foundValues;
 
-    if (values.empty()) {
+    // Scan through file linearly
+    ifstream infile(DB_FILE, ios::binary);
+    if (infile.is_open()) {
+        while (infile.peek() != EOF) {
+            int indexLen;
+            infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
+            if (infile.eof()) break;
+
+            string idx(indexLen, '\0');
+            infile.read(&idx[0], indexLen);
+
+            int numValues;
+            infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
+
+            if (idx == index) {
+                // Found our index
+                for (int i = 0; i < numValues; i++) {
+                    int val;
+                    infile.read(reinterpret_cast<char*>(&val), sizeof(val));
+                    foundValues.insert(val);
+                }
+                break; // No need to continue
+            } else {
+                // Skip values
+                infile.seekg(numValues * sizeof(int), ios::cur);
+            }
+        }
+        infile.close();
+    }
+
+    if (foundValues.empty()) {
         cout << "null" << endl;
     } else {
         bool first = true;
-        for (int val : values) {
+        for (int val : foundValues) {
             if (!first) cout << " ";
             cout << val;
             first = false;

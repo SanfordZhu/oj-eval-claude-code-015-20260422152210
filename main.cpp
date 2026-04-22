@@ -5,159 +5,201 @@
 #include <string>
 #include <sstream>
 #include <filesystem>
-#include <unordered_map>
+#include <map>
 #include <set>
 
 using namespace std;
 namespace fs = std::filesystem;
 
-const string DATA_DIR = "data";
-const string INDEX_FILE = DATA_DIR + "/index.dat";
-const int BUCKET_SIZE = 1000; // Group indices into buckets
+const string DB_FILE = "data/database.db";
 
 void ensureDataDir() {
-    if (!fs::exists(DATA_DIR)) {
-        fs::create_directory(DATA_DIR);
+    if (!fs::exists("data")) {
+        fs::create_directory("data");
     }
 }
 
-int getBucketId(const string& index) {
-    // Simple hash function to distribute indices
-    int hash = 0;
-    for (char c : index) {
-        hash = (hash * 31 + c) % 1000000;
-    }
-    return hash / BUCKET_SIZE;
-}
-
-string getBucketFilename(int bucketId) {
-    return DATA_DIR + "/bucket_" + to_string(bucketId) + ".dat";
-}
-
-struct IndexData {
-    string index;
-    set<int> values;
-};
-
-void writeBucket(int bucketId, const vector<IndexData>& bucketData) {
-    string filename = getBucketFilename(bucketId);
-    ofstream outfile(filename, ios::binary);
-    if (!outfile.is_open()) return;
-
-    int count = bucketData.size();
-    outfile.write(reinterpret_cast<const char*>(&count), sizeof(count));
-
-    for (const auto& data : bucketData) {
-        int indexLen = data.index.length();
-        outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
-        outfile.write(data.index.c_str(), indexLen);
-
-        int valueCount = data.values.size();
-        outfile.write(reinterpret_cast<const char*>(&valueCount), sizeof(valueCount));
-        for (int val : data.values) {
-            outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
-        }
-    }
-    outfile.close();
-}
-
-vector<IndexData> readBucket(int bucketId) {
-    vector<IndexData> bucketData;
-    string filename = getBucketFilename(bucketId);
-
-    if (!fs::exists(filename)) {
-        return bucketData;
-    }
-
-    ifstream infile(filename, ios::binary);
-    if (!infile.is_open()) return bucketData;
-
-    int count;
-    infile.read(reinterpret_cast<char*>(&count), sizeof(count));
-    bucketData.reserve(count);
-
-    for (int i = 0; i < count; i++) {
-        IndexData data;
-
-        int indexLen;
-        infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
-        data.index.resize(indexLen);
-        infile.read(&data.index[0], indexLen);
-
-        int valueCount;
-        infile.read(reinterpret_cast<char*>(&valueCount), sizeof(valueCount));
-        for (int j = 0; j < valueCount; j++) {
-            int val;
-            infile.read(reinterpret_cast<char*>(&val), sizeof(val));
-            data.values.insert(val);
-        }
-
-        bucketData.push_back(std::move(data));
-    }
-    infile.close();
-
-    return bucketData;
-}
+// Simple file format:
+// Header: number of indices (4 bytes)
+// For each index:
+//   - index length (4 bytes)
+//   - index string
+//   - number of values (4 bytes)
+//   - values (4 bytes each)
 
 void insert(const string& index, int value) {
     ensureDataDir();
-    int bucketId = getBucketId(index);
-    vector<IndexData> bucketData = readBucket(bucketId);
 
-    // Find the index in bucket
-    auto it = find_if(bucketData.begin(), bucketData.end(),
-                      [&index](const IndexData& d) { return d.index == index; });
+    // Read entire database
+    map<string, set<int>> db;
 
-    if (it == bucketData.end()) {
-        // New index
-        IndexData newData;
-        newData.index = index;
-        newData.values.insert(value);
-        bucketData.push_back(std::move(newData));
-    } else {
-        // Existing index
-        it->values.insert(value);
+    if (fs::exists(DB_FILE)) {
+        ifstream infile(DB_FILE, ios::binary);
+        if (infile.is_open()) {
+            int numIndices;
+            infile.read(reinterpret_cast<char*>(&numIndices), sizeof(numIndices));
+
+            for (int i = 0; i < numIndices; i++) {
+                int indexLen;
+                infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
+
+                string idx(indexLen, '\0');
+                infile.read(&idx[0], indexLen);
+
+                int numValues;
+                infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
+
+                set<int> values;
+                for (int j = 0; j < numValues; j++) {
+                    int val;
+                    infile.read(reinterpret_cast<char*>(&val), sizeof(val));
+                    values.insert(val);
+                }
+
+                db[idx] = values;
+            }
+            infile.close();
+        }
     }
 
-    writeBucket(bucketId, bucketData);
+    // Update database
+    db[index].insert(value);
+
+    // Write entire database back
+    ofstream outfile(DB_FILE, ios::binary);
+    if (outfile.is_open()) {
+        int numIndices = db.size();
+        outfile.write(reinterpret_cast<const char*>(&numIndices), sizeof(numIndices));
+
+        for (const auto& [idx, values] : db) {
+            int indexLen = idx.length();
+            outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
+            outfile.write(idx.c_str(), indexLen);
+
+            int numValues = values.size();
+            outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
+
+            for (int val : values) {
+                outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
+            }
+        }
+        outfile.close();
+    }
 }
 
 void deleteEntry(const string& index, int value) {
     ensureDataDir();
-    int bucketId = getBucketId(index);
-    vector<IndexData> bucketData = readBucket(bucketId);
 
-    // Find the index in bucket
-    auto it = find_if(bucketData.begin(), bucketData.end(),
-                      [&index](const IndexData& d) { return d.index == index; });
+    if (!fs::exists(DB_FILE)) {
+        return;
+    }
 
-    if (it != bucketData.end()) {
-        // Remove value if exists
-        it->values.erase(value);
+    // Read entire database
+    map<string, set<int>> db;
 
-        // If no values left, remove the index
-        if (it->values.empty()) {
-            bucketData.erase(it);
+    ifstream infile(DB_FILE, ios::binary);
+    if (infile.is_open()) {
+        int numIndices;
+        infile.read(reinterpret_cast<char*>(&numIndices), sizeof(numIndices));
+
+        for (int i = 0; i < numIndices; i++) {
+            int indexLen;
+            infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
+
+            string idx(indexLen, '\0');
+            infile.read(&idx[0], indexLen);
+
+            int numValues;
+            infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
+
+            set<int> values;
+            for (int j = 0; j < numValues; j++) {
+                int val;
+                infile.read(reinterpret_cast<char*>(&val), sizeof(val));
+                values.insert(val);
+            }
+
+            db[idx] = values;
         }
+        infile.close();
+    }
 
-        writeBucket(bucketId, bucketData);
+    // Update database
+    auto it = db.find(index);
+    if (it != db.end()) {
+        it->second.erase(value);
+        if (it->second.empty()) {
+            db.erase(it);
+        }
+    }
+
+    // Write entire database back
+    ofstream outfile(DB_FILE, ios::binary);
+    if (outfile.is_open()) {
+        int numIndices = db.size();
+        outfile.write(reinterpret_cast<const char*>(&numIndices), sizeof(numIndices));
+
+        for (const auto& [idx, values] : db) {
+            int indexLen = idx.length();
+            outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
+            outfile.write(idx.c_str(), indexLen);
+
+            int numValues = values.size();
+            outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
+
+            for (int val : values) {
+                outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
+            }
+        }
+        outfile.close();
     }
 }
 
 void find(const string& index) {
     ensureDataDir();
-    int bucketId = getBucketId(index);
-    vector<IndexData> bucketData = readBucket(bucketId);
 
-    // Find the index in bucket
-    auto it = find_if(bucketData.begin(), bucketData.end(),
-                      [&index](const IndexData& d) { return d.index == index; });
+    if (!fs::exists(DB_FILE)) {
+        cout << "null" << endl;
+        return;
+    }
 
-    if (it == bucketData.end() || it->values.empty()) {
+    // Read entire database
+    map<string, set<int>> db;
+
+    ifstream infile(DB_FILE, ios::binary);
+    if (infile.is_open()) {
+        int numIndices;
+        infile.read(reinterpret_cast<char*>(&numIndices), sizeof(numIndices));
+
+        for (int i = 0; i < numIndices; i++) {
+            int indexLen;
+            infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
+
+            string idx(indexLen, '\0');
+            infile.read(&idx[0], indexLen);
+
+            int numValues;
+            infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
+
+            set<int> values;
+            for (int j = 0; j < numValues; j++) {
+                int val;
+                infile.read(reinterpret_cast<char*>(&val), sizeof(val));
+                values.insert(val);
+            }
+
+            db[idx] = values;
+        }
+        infile.close();
+    }
+
+    // Find and output
+    auto it = db.find(index);
+    if (it == db.end() || it->second.empty()) {
         cout << "null" << endl;
     } else {
         bool first = true;
-        for (int val : it->values) {
+        for (int val : it->second) {
             if (!first) cout << " ";
             cout << val;
             first = false;

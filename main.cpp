@@ -13,25 +13,62 @@ namespace fs = std::filesystem;
 
 const string DB_FILE = "data/database.db";
 
+// Cache only the most recently accessed index
+string cachedIndex;
+set<int> cachedValues;
+bool cacheValid = false;
+
 void ensureDataDir() {
     if (!fs::exists("data")) {
         fs::create_directory("data");
     }
 }
 
-// Simple file format:
-// Header: number of indices (4 bytes)
-// For each index:
-//   - index length (4 bytes)
-//   - index string
-//   - number of values (4 bytes)
-//   - values (4 bytes each)
+// Read specific index from file
+bool readIndexFromFile(const string& index, set<int>& values) {
+    if (!fs::exists(DB_FILE)) {
+        return false;
+    }
 
-void insert(const string& index, int value) {
-    ensureDataDir();
+    ifstream infile(DB_FILE, ios::binary);
+    if (!infile.is_open()) return false;
 
-    // Read entire database
-    map<string, set<int>> db;
+    int numIndices;
+    infile.read(reinterpret_cast<char*>(&numIndices), sizeof(numIndices));
+
+    for (int i = 0; i < numIndices; i++) {
+        int indexLen;
+        infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
+
+        string idx(indexLen, '\0');
+        infile.read(&idx[0], indexLen);
+
+        int numValues;
+        infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
+
+        if (idx == index) {
+            // Found the index
+            for (int j = 0; j < numValues; j++) {
+                int val;
+                infile.read(reinterpret_cast<char*>(&val), sizeof(val));
+                values.insert(val);
+            }
+            infile.close();
+            return true;
+        } else {
+            // Skip this index's values
+            infile.seekg(numValues * sizeof(int), ios::cur);
+        }
+    }
+
+    infile.close();
+    return false;
+}
+
+// Write entire file with updated values for specific index
+void updateIndexInFile(const string& index, const set<int>& values, bool deleteIndex = false) {
+    // First, read all indices except the one being updated
+    map<string, set<int>> otherIndices;
 
     if (fs::exists(DB_FILE)) {
         ifstream infile(DB_FILE, ios::binary);
@@ -49,157 +86,130 @@ void insert(const string& index, int value) {
                 int numValues;
                 infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
 
-                set<int> values;
-                for (int j = 0; j < numValues; j++) {
-                    int val;
-                    infile.read(reinterpret_cast<char*>(&val), sizeof(val));
-                    values.insert(val);
+                if (idx != index) {
+                    set<int> vals;
+                    for (int j = 0; j < numValues; j++) {
+                        int val;
+                        infile.read(reinterpret_cast<char*>(&val), sizeof(val));
+                        vals.insert(val);
+                    }
+                    otherIndices[idx] = vals;
+                } else {
+                    // Skip the index being updated
+                    infile.seekg(numValues * sizeof(int), ios::cur);
                 }
-
-                db[idx] = values;
             }
             infile.close();
         }
     }
 
-    // Update database
-    db[index].insert(value);
-
-    // Write entire database back
+    // Write back all indices
     ofstream outfile(DB_FILE, ios::binary);
-    if (outfile.is_open()) {
-        int numIndices = db.size();
-        outfile.write(reinterpret_cast<const char*>(&numIndices), sizeof(numIndices));
+    if (!outfile.is_open()) return;
 
-        for (const auto& [idx, values] : db) {
-            int indexLen = idx.length();
-            outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
-            outfile.write(idx.c_str(), indexLen);
+    int totalIndices = otherIndices.size() + (deleteIndex || values.empty() ? 0 : 1);
+    outfile.write(reinterpret_cast<const char*>(&totalIndices), sizeof(totalIndices));
 
-            int numValues = values.size();
-            outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
+    for (const auto& [idx, vals] : otherIndices) {
+        int indexLen = idx.length();
+        outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
+        outfile.write(idx.c_str(), indexLen);
 
-            for (int val : values) {
-                outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
-            }
+        int numValues = vals.size();
+        outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
+
+        for (int val : vals) {
+            outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
         }
-        outfile.close();
     }
+
+    // Add the updated index if not deleting
+    if (!deleteIndex && !values.empty()) {
+        int indexLen = index.length();
+        outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
+        outfile.write(index.c_str(), indexLen);
+
+        int numValues = values.size();
+        outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
+
+        for (int val : values) {
+            outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
+        }
+    }
+
+    outfile.close();
+}
+
+void insert(const string& index, int value) {
+    ensureDataDir();
+
+    set<int> values;
+
+    // Use cache if available
+    if (cacheValid && cachedIndex == index) {
+        values = cachedValues;
+    } else {
+        readIndexFromFile(index, values);
+    }
+
+    values.insert(value);
+
+    // Update cache
+    cachedIndex = index;
+    cachedValues = values;
+    cacheValid = true;
+
+    updateIndexInFile(index, values);
 }
 
 void deleteEntry(const string& index, int value) {
     ensureDataDir();
 
-    if (!fs::exists(DB_FILE)) {
-        return;
-    }
+    set<int> values;
 
-    // Read entire database
-    map<string, set<int>> db;
-
-    ifstream infile(DB_FILE, ios::binary);
-    if (infile.is_open()) {
-        int numIndices;
-        infile.read(reinterpret_cast<char*>(&numIndices), sizeof(numIndices));
-
-        for (int i = 0; i < numIndices; i++) {
-            int indexLen;
-            infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
-
-            string idx(indexLen, '\0');
-            infile.read(&idx[0], indexLen);
-
-            int numValues;
-            infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
-
-            set<int> values;
-            for (int j = 0; j < numValues; j++) {
-                int val;
-                infile.read(reinterpret_cast<char*>(&val), sizeof(val));
-                values.insert(val);
-            }
-
-            db[idx] = values;
-        }
-        infile.close();
-    }
-
-    // Update database
-    auto it = db.find(index);
-    if (it != db.end()) {
-        it->second.erase(value);
-        if (it->second.empty()) {
-            db.erase(it);
+    // Use cache if available
+    if (cacheValid && cachedIndex == index) {
+        values = cachedValues;
+    } else {
+        if (!readIndexFromFile(index, values)) {
+            return; // Index doesn't exist
         }
     }
 
-    // Write entire database back
-    ofstream outfile(DB_FILE, ios::binary);
-    if (outfile.is_open()) {
-        int numIndices = db.size();
-        outfile.write(reinterpret_cast<const char*>(&numIndices), sizeof(numIndices));
+    values.erase(value);
 
-        for (const auto& [idx, values] : db) {
-            int indexLen = idx.length();
-            outfile.write(reinterpret_cast<const char*>(&indexLen), sizeof(indexLen));
-            outfile.write(idx.c_str(), indexLen);
+    // Update cache
+    cachedIndex = index;
+    cachedValues = values;
+    cacheValid = true;
 
-            int numValues = values.size();
-            outfile.write(reinterpret_cast<const char*>(&numValues), sizeof(numValues));
-
-            for (int val : values) {
-                outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
-            }
-        }
-        outfile.close();
-    }
+    updateIndexInFile(index, values, values.empty());
 }
 
 void find(const string& index) {
     ensureDataDir();
 
-    if (!fs::exists(DB_FILE)) {
-        cout << "null" << endl;
-        return;
-    }
+    set<int> values;
 
-    // Read entire database
-    map<string, set<int>> db;
-
-    ifstream infile(DB_FILE, ios::binary);
-    if (infile.is_open()) {
-        int numIndices;
-        infile.read(reinterpret_cast<char*>(&numIndices), sizeof(numIndices));
-
-        for (int i = 0; i < numIndices; i++) {
-            int indexLen;
-            infile.read(reinterpret_cast<char*>(&indexLen), sizeof(indexLen));
-
-            string idx(indexLen, '\0');
-            infile.read(&idx[0], indexLen);
-
-            int numValues;
-            infile.read(reinterpret_cast<char*>(&numValues), sizeof(numValues));
-
-            set<int> values;
-            for (int j = 0; j < numValues; j++) {
-                int val;
-                infile.read(reinterpret_cast<char*>(&val), sizeof(val));
-                values.insert(val);
-            }
-
-            db[idx] = values;
+    // Use cache if available
+    if (cacheValid && cachedIndex == index) {
+        values = cachedValues;
+    } else {
+        if (!readIndexFromFile(index, values)) {
+            cout << "null" << endl;
+            return;
         }
-        infile.close();
+        // Update cache
+        cachedIndex = index;
+        cachedValues = values;
+        cacheValid = true;
     }
 
-    // Find and output
-    auto it = db.find(index);
-    if (it == db.end() || it->second.empty()) {
+    if (values.empty()) {
         cout << "null" << endl;
     } else {
         bool first = true;
-        for (int val : it->second) {
+        for (int val : values) {
             if (!first) cout << " ";
             cout << val;
             first = false;
